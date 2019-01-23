@@ -1,0 +1,181 @@
+######################################################################################################################
+# Author: Alex Keil
+# Program: wwbd_simfunctions_20190101.R
+# Language: R
+# Date: Tuesday, January 1, 2019
+# Project: Well water/birth defects Aim 1 simulations
+# Tasks: File to keep R functions
+# Data in: 
+# Data out: 
+# Description:
+# Keywords:
+# Released under the GNU General Public License: http://www.gnu.org/copyleft/gpl.html
+######################################################################################################################
+
+
+#######################
+# functions
+#######################
+data_importer <- function(){
+  require(readr)
+  # read data and do elementary processing, take only single iteration of simulated data
+  cat("Reading in data from github\n")
+  raw <- read_csv("https://cirl-unc.github.io/wellwater/data/testdata.csv", col_types = cols())
+  raw
+  }
+
+data_reader <- function(raw, i){
+  require(dplyr)
+  # read data and do elementary processing, take only single iteration of simulated data
+  dat <- raw %>%
+    filter(iter==i) %>%
+    select(
+      c("iter", "y", "Arsenic", "Manganese", "Lead", "Cadmium", "Copper")
+    ) %>%
+    filter(complete.cases(.))
+  
+  with(dat, 
+       list(y=y, X=as.matrix(select(dat, c("Arsenic", "Manganese", "Lead", "Cadmium", "Copper"))), 
+            dx=5, p=10,N=length(y))
+  )
+}
+
+data_analyst <- function(i, raw=raw, fl="~/temp.csv", s.code = NULL){
+  require(rstan)
+  # do single analysis of data
+  #stan model
+  if(is.null(s.code)) {
+  s.code <- '
+   // example with horseshoe prior
+   data{
+    int<lower=0> N;
+    int<lower=0> p;
+    int<lower=0> dx;
+    vector[dx] X[N]; // functions like Nx5 matrix (but each column is real[])
+    int y[N];
+   }
+   transformed data{
+    //real meany;
+    //vector[N] ycen;
+    matrix[N,p] D;
+
+    //meany = mean(y);
+    //ycen = y-meany;
+   // todo: transform y to center!
+    for(c in 1:dx){
+     D[,c] = to_vector(X[,c]);
+     //D[,c] = X[,c];
+    }
+    for(c in (dx+1):p){
+     D[,c] = to_vector(X[,c-5]) .* to_vector(X[,c-5]);
+     //D[,c] = X[,c-5] .* X[,c-5];
+    }
+   }
+   parameters{
+    vector<lower=0>[p] lambda; // local shrinkage
+    vector[p] beta;
+    real<lower=0> sigma;
+    real b0; // given uniform prior
+    real<lower=0> tau; // global shrinkage
+    //real<lower=0> sig; // global shrinkage hyperprior
+   }
+   transformed parameters{}
+   model{
+    {
+     vector[N] mu;
+     lambda ~ cauchy(0,1.0); // local shrinkage
+     tau ~ cauchy(0,1.0); // global shrinkage
+     target += -log(sigma*sigma); // jeffreys prior
+     beta ~ normal(0,lambda * tau * sigma);
+     mu = b0 + D * beta;
+     y ~ bernoulli_logit(mu);
+    }
+   }
+   generated quantities{
+   real rd;
+    {
+     vector[N] r1;
+     vector[N] r0;
+     matrix[N,p] D1;
+     matrix[N,p] D0;
+      D1=D;
+      D0=D;
+     for(i in 1:N){
+        // this is intervention to set exposure 1 to 1.0 versus 0.0 (i.e. both main effect
+        // and the self interaction term go to 1.0
+        D1[i,1] = 1.0;
+        D1[i,6] = 1.0;
+        D0[i,1] = 0.0;
+        D0[i,6] = 0.0;
+      }
+    
+      r1 =  inv_logit(b0 + D1 * beta);
+      r0 =  inv_logit(b0 + D0 * beta);
+      rd = mean(r1)-mean(r0);
+    }
+   }
+'
+  }
+  sdat = data_reader(raw, i)
+  # note: keep warming up even for a while after apparent convergence: helps improve efficiency
+  #  of adaptive algorithm 
+  res = stan(model_code = s.code, data = sdat, chains = 4, sample_file=fl, iter=2500, warmup=500)
+  #step to include here: automated monitoring for convergence and continued sampling if not converged
+  #class(res) <- 'bgfsimmod'
+  res
+}
+
+analysis_wrapper <- function(iter, rawdata, dir="~/temp/", root, ...){
+  # perform multiple analyses
+  if(length(iter)==1) {
+    sq = 1:iter
+  } else{
+    sq = iter
+  }
+  cat(paste0("Analyzing data ", length(sq), " times\n"))
+  cat(paste0("R output can be seen at ", paste0(dir, root, "rmsg.txt"), "\n"))
+  res = list(1:length(sq))
+  j=1
+  for(i in sq){
+    cat(".")
+    sink(paste0(dir, root, "rmsg.txt"), split = FALSE, type = c("output", "message"))
+    res[[j]] = data_analyst(i, rawdata, paste0(dir, root, i, ".csv"), ...)
+    sink()
+    j=j+1
+  }
+    cat("\n")
+  class(res) <- 'bgfsimmodlist'
+  res
+}
+
+summary.bgfsimmodlist <- function(res=NULL){
+  # summarize
+  # to do
+  # if have values stored from analysis_wrapper, then use those
+  # else read csv files
+  numf = length(res)
+  postmeans = numeric(numf)
+  for(r in 1:numf){
+    postmeans[r] = summary(res[[r]])$summary['rd',1]
+  }
+  # report on posterior mean risk difference for each iteration
+  ret = list(postmeans=postmeans, 
+    summary=c(
+      mean=mean(postmeans),
+      sd = sd(postmeans),
+      min = min(postmeans),
+      max = max(postmeans),
+      p25 = as.numeric(quantile(postmeans,p=0.25)),
+      p75 = as.numeric(quantile(postmeans,p=0.75))
+    ))
+  class(ret) <- 'bgfsimres' #defines this as an S3 object which allows us to do some shortcuts for methods
+  ret
+}
+
+print.bgfsimres <- function(obj){
+ print(obj$summary)
+}
+
+plot.bgfsimres <- function(obj){
+ plot(density(obj$postmeans))
+}
